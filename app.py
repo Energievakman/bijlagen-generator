@@ -749,11 +749,11 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
     signature_image = make_signature_image(signature_value)
 
     if document_type == "opdrachtbevestiging":
-    signature_label = "Opdrachtgever"
-    signature_name = opdrachtgever
-else:
-    signature_label = "Adviseur"
-    signature_name = adviseur
+        signature_label = "Opdrachtgever"
+        signature_name = opdrachtgever
+    else:
+        signature_label = "Adviseur"
+        signature_name = adviseur
 
 signature_data = [
     [Paragraph(signature_label, styles["SmallBold"]),
