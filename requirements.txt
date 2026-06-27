@@ -1,0 +1,6 @@
+Flask==3.0.3
+gunicorn==22.0.0
+requests==2.32.3
+reportlab==4.2.2
+cloudinary==1.41.0
+Werkzeug==3.0.3
