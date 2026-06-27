@@ -11,6 +11,7 @@ import threading
 import traceback
 from pathlib import Path
 from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 
 import requests
 from reportlab.lib import colors
@@ -35,6 +36,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+APP_VERSION = "v9_opdrachtbevestiging_echte_branch_zonder_bijlage4_tabel_20260627"
 
 
 @app.errorhandler(HTTPException)
@@ -542,6 +544,93 @@ def make_signature_image(signature_value):
         return ""
 
 
+
+OPDRACHTBEVESTIGING_DEFAULT_VOORWAARDEN = [
+    "De opdrachtgever is eigenaar van het betreffende object of geeft de opdracht namens de eigenaar.",
+    "De opnamegegevens, aanwezige tekeningen, meetstaten, plattegronden en installatieschema’s worden toegevoegd aan het digitale dossier. Ook worden er foto’s gemaakt van en in het object. Deze gegevens worden 15 jaar bewaard.",
+    "Als opdrachtgever heeft u het recht om het volledige projectdossier op te vragen bij het bedrijf dat de werkzaamheden uitvoert.",
+    "De objectkenmerken die worden opgenomen in het monitoringsbestand worden geregistreerd in de landelijke energielabeldatabase van de RVO: www.ep-online.nl.",
+    "U stemt ermee in dat de opnamegegevens kunnen worden doorgegeven aan de Rijksoverheid en aan de certificerende instelling (CI) van het bedrijf dat de werkzaamheden uitvoert.",
+    "Wanneer er een audit of kwaliteitscontrole plaatsvindt, dient u het bedrijf dat de werkzaamheden heeft uitgevoerd en de certificerende instelling opnieuw toegang te verlenen tot het object. Als toegang wordt geweigerd, kan het energielabel worden ingetrokken. U wordt hierover geïnformeerd.",
+    "Het actuele procescertificaat van De Energievakman is te vinden in het Centraal Register Techniek.",
+]
+
+
+def pdf_escape(value) -> str:
+    """Escape tekst voor ReportLab Paragraph."""
+    return xml_escape(clean_value(value)).replace("\n", "<br/>")
+
+
+def p(value, style):
+    return Paragraph(pdf_escape(value), style)
+
+
+def split_voorwaarden(value) -> list:
+    """Maak nette bullets van het veld Voorwaarden.
+
+    Als het record geen voorwaarden bevat, gebruiken we de standaard voorwaarden.
+    Ondersteunt tekst met bullettekens, newlines of één lange alinea.
+    """
+    raw = clean_value(value)
+    if raw == "-":
+        return OPDRACHTBEVESTIGING_DEFAULT_VOORWAARDEN
+
+    normalized = raw.replace("\r", "\n").strip()
+    parts = re.split(r"\s*•\s*", normalized)
+    parts = [part.strip(" \n\t-") for part in parts if part.strip(" \n\t-")]
+
+    if len(parts) <= 1:
+        line_parts = [part.strip(" \n\t-") for part in normalized.split("\n") if part.strip(" \n\t-")]
+        if len(line_parts) > 1:
+            parts = line_parts
+
+    return parts if parts else OPDRACHTBEVESTIGING_DEFAULT_VOORWAARDEN
+
+
+def make_opdrachtbevestiging_table(source_fields: dict, styles):
+    voorwaarden_raw = pick(source_fields, "Voorwaarden", "voorwaarden", default="")
+    voorwaarden = split_voorwaarden(voorwaarden_raw)
+
+    bullet_style = ParagraphStyle(
+        name="BulletSmallEV",
+        parent=styles["Small"],
+        leftIndent=7,
+        firstLineIndent=-7,
+        leading=11,
+        spaceAfter=4,
+    )
+    bullet_flowables = [
+        Paragraph("• " + pdf_escape(item), bullet_style)
+        for item in voorwaarden
+    ]
+
+    uw_adviseur = clean_value(
+        pick(source_fields, "Uw adviseur", "Adviseur", "Naam adviseur", default=env("DEFAULT_ADVISOR", "Otto Boender"))
+    )
+    opnamedatum = clean_value(
+        pick(source_fields, "Opnamedatum", "Opname datum", "Datum opname", default="-")
+    )
+
+    table_data = [
+        [Paragraph("Omschrijving", styles["SmallBold"]), Paragraph("Waarde", styles["SmallBold"])],
+        [Paragraph("Voorwaarden", styles["Small"]), bullet_flowables],
+        [Paragraph("Uw adviseur", styles["Small"]), Paragraph(pdf_escape(uw_adviseur), styles["Small"])],
+        [Paragraph("Opnamedatum", styles["Small"]), Paragraph(pdf_escape(opnamedatum), styles["Small"])],
+    ]
+    table = Table(table_data, colWidths=[95 * mm, 81 * mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDDDDD")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEEEEE")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return table, uw_adviseur, opnamedatum
+
+
 def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path: Path) -> dict:
     cfg = DOCUMENT_CONFIG[document_type]
 
@@ -554,10 +643,18 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
         payload.get("opdrachtgever")
         or pick(source_fields, "Opdrachtgever", "Klant", "Naam opdrachtgever")
     )
-    adviseur = clean_value(
-        payload.get("adviseur")
-        or pick(source_fields, "Adviseur", "Naam adviseur", default=env("DEFAULT_ADVISOR", "Otto Boender"))
-    )
+
+    if document_type == "opdrachtbevestiging":
+        adviseur = clean_value(
+            payload.get("adviseur")
+            or pick(source_fields, "Uw adviseur", "Adviseur", "Naam adviseur", default=env("DEFAULT_ADVISOR", "Otto Boender"))
+        )
+    else:
+        adviseur = clean_value(
+            payload.get("adviseur")
+            or pick(source_fields, "Adviseur", "Naam adviseur", default=env("DEFAULT_ADVISOR", "Otto Boender"))
+        )
+
     datum = clean_value(
         payload.get("datum")
         or pick(source_fields, "Datum", "Gegenereerd op", default=now_nl())
@@ -584,9 +681,9 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
     story.append(Spacer(1, 8 * mm))
 
     header_data = [
-        [Paragraph("Adres", styles["SmallBold"]), Paragraph(address, styles["Small"])],
-        [Paragraph("Opdrachtgever", styles["SmallBold"]), Paragraph(opdrachtgever, styles["Small"])],
-        [Paragraph("Datum", styles["SmallBold"]), Paragraph(datum, styles["Small"])],
+        [Paragraph("Adres", styles["SmallBold"]), Paragraph(pdf_escape(address), styles["Small"])],
+        [Paragraph("Opdrachtgever", styles["SmallBold"]), Paragraph(pdf_escape(opdrachtgever), styles["Small"])],
+        [Paragraph("Datum", styles["SmallBold"]), Paragraph(pdf_escape(datum), styles["Small"])],
     ]
     header = Table(header_data, colWidths=[48 * mm, 128 * mm])
     header.setStyle(TableStyle([
@@ -602,38 +699,58 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
     story.append(header)
     story.append(Spacer(1, 7 * mm))
 
-    items = build_items(payload, source_fields)
-    table_data = [[Paragraph("Omschrijving", styles["SmallBold"]), Paragraph("Aanwezig / waarde", styles["SmallBold"])] ]
-    for label, value in items:
-        table_data.append([Paragraph(str(label), styles["Small"]), Paragraph(clean_value(value), styles["Small"])])
+    # Belangrijk: opdrachtbevestiging krijgt NIET de Bijlage-4 informatietabel.
+    # Alleen Bijlage 4 gebruikt build_items() met bouwkundige tekeningen enz.
+    opnamedatum = "-"
+    if document_type == "opdrachtbevestiging":
+        opdracht_table, adviseur_from_table, opnamedatum = make_opdrachtbevestiging_table(source_fields, styles)
+        adviseur = clean_value(payload.get("adviseur") or adviseur_from_table)
+        story.append(opdracht_table)
+        story.append(Spacer(1, 8 * mm))
+    else:
+        items = build_items(payload, source_fields)
+        table_data = [[Paragraph("Omschrijving", styles["SmallBold"]), Paragraph("Aanwezig / waarde", styles["SmallBold"])]]
+        for label, value in items:
+            table_data.append([Paragraph(pdf_escape(label), styles["Small"]), Paragraph(pdf_escape(clean_value(value)), styles["Small"])])
 
-    info_table = Table(table_data, colWidths=[95 * mm, 81 * mm], repeatRows=1)
-    info_table.setStyle(TableStyle([
-        ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDDDDD")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEEEEE")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(info_table)
-    story.append(Spacer(1, 8 * mm))
+        info_table = Table(table_data, colWidths=[95 * mm, 81 * mm], repeatRows=1)
+        info_table.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDDDDD")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEEEEE")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(info_table)
+        story.append(Spacer(1, 8 * mm))
 
-    signature_value = (
-        payload.get("signature_url")
-        or payload.get("signature_path")
-        or payload.get("paraaf")
-        or pick_raw(source_fields, "Paraaf", "Signature", "Handtekening", "Paraaf PNG", "Paraaf png")
-        or env("SIGNATURE_URL")
-        or env("SIGNATURE_PATH")
-    )
+    if document_type == "opdrachtbevestiging":
+        signature_value = (
+            payload.get("signature_url")
+            or payload.get("signature_path")
+            or payload.get("paraaf")
+            or pick_raw(source_fields, "Akkoord", "Paraaf", "Signature", "Handtekening", "Paraaf PNG", "Paraaf png")
+            or env("SIGNATURE_URL")
+            or env("SIGNATURE_PATH")
+        )
+    else:
+        signature_value = (
+            payload.get("signature_url")
+            or payload.get("signature_path")
+            or payload.get("paraaf")
+            or pick_raw(source_fields, "Paraaf", "Signature", "Handtekening", "Paraaf PNG", "Paraaf png")
+            or env("SIGNATURE_URL")
+            or env("SIGNATURE_PATH")
+        )
+
     signature_image = make_signature_image(signature_value)
 
     signature_data = [
         [Paragraph("Adviseur", styles["SmallBold"]), Paragraph("Paraaf", styles["SmallBold"])],
-        [Paragraph(adviseur, styles["Small"]), signature_image],
+        [Paragraph(pdf_escape(adviseur), styles["Small"]), signature_image],
     ]
     signature = Table(signature_data, colWidths=[80 * mm, 96 * mm], rowHeights=[8 * mm, 24 * mm])
     signature.setStyle(TableStyle([
@@ -654,7 +771,9 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
         "opdrachtgever": opdrachtgever,
         "adviseur": adviseur,
         "datum": datum,
+        "opnamedatum": opnamedatum,
         "signature_included": bool(signature_image),
+        "version": APP_VERSION,
     }
 
 
@@ -872,6 +991,7 @@ def home():
     return jsonify({
         "status": "ok",
         "message": "Softr documentgenerator draait",
+        "version": APP_VERSION,
         "endpoints": {
             "bijlage4": "POST /generate/bijlage4",
             "opdrachtbevestiging": "POST /generate/opdrachtbevestiging",
@@ -883,7 +1003,7 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "version": APP_VERSION})
 
 
 if __name__ == "__main__":
