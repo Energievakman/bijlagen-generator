@@ -748,10 +748,19 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
 
     signature_image = make_signature_image(signature_value)
 
-    signature_data = [
-        [Paragraph("Adviseur", styles["SmallBold"]), Paragraph("Paraaf", styles["SmallBold"])],
-        [Paragraph(pdf_escape(adviseur), styles["Small"]), signature_image],
-    ]
+    if document_type == "opdrachtbevestiging":
+    signature_label = "Opdrachtgever"
+    signature_name = opdrachtgever
+else:
+    signature_label = "Adviseur"
+    signature_name = adviseur
+
+signature_data = [
+    [Paragraph(signature_label, styles["SmallBold"]),
+     Paragraph("Paraaf", styles["SmallBold"])],
+    [Paragraph(pdf_escape(signature_name), styles["Small"]),
+     signature_image],
+]
     signature = Table(signature_data, colWidths=[80 * mm, 96 * mm], rowHeights=[8 * mm, 24 * mm])
     signature.setStyle(TableStyle([
         ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDDDDD")),
