@@ -90,9 +90,9 @@ DOCUMENT_CONFIG = {
 
 DEFAULT_INFO_ROWS = [
     "Bouwkundige tekeningen",
-    "Plattegronden",
     "Gevelaanzichten",
     "Doorsnedes",
+    "Plattegronden",
     "Constructietekeningen",
     "Installatieontwerp van het gebouw",
     "Installatietekeningen voor verwarming",
@@ -104,6 +104,37 @@ DEFAULT_INFO_ROWS = [
     "Aanvraag bouwvergunning",
     "Verleende bouwvergunning",
 ]
+
+
+# Keuzevelden uit Softr kunnen soms als interne UUID binnenkomen.
+# Hiermee tonen we in de PDF de leesbare dropdown-waarde in plaats van een nieuwe losse rij.
+OPTION_VALUE_LABELS = {
+    "45ad207d-14ac-4c46-966b-c56c852eaf1f": "Revisie",
+    "e320ced2-e7a7-4cb8-bd40-fe39e77ad5ed": "Bestek",
+    "64c6112a-3ec8-4cf8-ad2e-80be9a68d50b": "Toets Bbl",
+}
+
+# Deze velden horen inhoudelijk bij bestaande regels in Bijlage 4.
+# Ze mogen dus niet als extra losse rij onderaan de PDF verschijnen.
+INFO_FIELD_ALIASES = {
+    "met plattegronden": "Plattegronden",
+    "plattegronden aanwezig": "Plattegronden",
+    "type plattegronden": "Plattegronden",
+    "dwarsdoorsnede": "Doorsnedes",
+    "dwarsdoorsneden": "Doorsnedes",
+    "met doorsnedes": "Doorsnedes",
+    "met dwarsdoorsnede": "Doorsnedes",
+    "detailtekeningen bouwkundige constructies": "Constructietekeningen",
+    "bouwkundige constructies": "Constructietekeningen",
+}
+
+INSTALLATIE_FIELD_NAMES = {
+    "installaties",
+    "installatietekeningen",
+    "met installatietekeningen",
+    "installatietekeningen aanwezig",
+    "type installatietekeningen",
+}
 
 INTERNAL_KEYS = {
     "secret",
@@ -451,48 +482,139 @@ def softr_patch_dossier_file_background(dossier_record_id: str, field_id: str, f
 # -----------------------------------------------------------------------------
 
 
+def display_choice_value(value):
+    """Toon Softr-keuzes leesbaar en vervang bekende UUID's door labels."""
+    if value is None:
+        return "-"
+    if isinstance(value, list):
+        parts = [display_choice_value(item) for item in value]
+        parts = [part for part in parts if part and part != "-"]
+        return ", ".join(parts) if parts else "-"
+    if isinstance(value, dict):
+        raw = value.get("name") or value.get("label") or value.get("value") or value.get("id")
+        return display_choice_value(raw)
+
+    raw = clean_value(value)
+    if raw == "-":
+        return "-"
+
+    parts = [part.strip() for part in str(raw).split(",") if part.strip()]
+    converted = [OPTION_VALUE_LABELS.get(part, part) for part in parts]
+    return ", ".join(converted) if converted else "-"
+
+
+def find_source_value(source_fields: dict, *field_names):
+    """Pak een waarde op basis van veldnamen, case-insensitive."""
+    if not isinstance(source_fields, dict):
+        return None
+    wanted = {str(name).strip().lower() for name in field_names if str(name).strip()}
+    for key, value in source_fields.items():
+        if str(key).strip().lower() in wanted and clean_value(value) != "-":
+            return value
+    return None
+
+
+def label_has_choice(source_fields: dict, *choices) -> bool:
+    """Controleer of een multi-select veld één van de gevraagde keuzes bevat."""
+    wanted = {choice.lower() for choice in choices}
+    for key, value in source_fields.items():
+        if str(key).strip().lower() not in INSTALLATIE_FIELD_NAMES:
+            continue
+        readable = display_choice_value(value).lower()
+        if any(choice in readable for choice in wanted):
+            return True
+    return False
+
+
+def bijlage4_value_for_label(label: str, source_fields: dict) -> str:
+    """Bepaal de rechterkolomwaarde voor een vaste Bijlage 4-regel."""
+    direct = pick(source_fields, label, default="-")
+    if clean_value(direct) != "-":
+        return display_choice_value(direct)
+
+    label_norm = label.strip().lower()
+
+    alias_names = [
+        key for key, target_label in INFO_FIELD_ALIASES.items()
+        if target_label.strip().lower() == label_norm
+    ]
+    alias_value = find_source_value(source_fields, *alias_names)
+    if alias_value is not None:
+        return display_choice_value(alias_value)
+
+    if label_norm == "installatietekeningen voor verwarming" and label_has_choice(source_fields, "verwarming"):
+        return "Verwarming"
+    if label_norm == "installatietekeningen voor tapwater" and label_has_choice(source_fields, "tapwater"):
+        return "Tapwater"
+    if label_norm == "installatietekeningen voor koeling" and label_has_choice(source_fields, "koeling"):
+        return "Koeling"
+
+    return "-"
+
+
+def should_skip_extra_info_field(key: str) -> bool:
+    """Voorkom dubbele losse rijen voor velden die al in vaste regels verwerkt zijn."""
+    key_norm = str(key or "").strip().lower()
+    if should_skip_info_field(key_norm):
+        return True
+    if key_norm in {label.lower() for label in DEFAULT_INFO_ROWS}:
+        return True
+    if key_norm in INFO_FIELD_ALIASES:
+        return True
+    if key_norm in INSTALLATIE_FIELD_NAMES:
+        return True
+    return False
+
+
 def build_items(payload: dict, source_fields: dict) -> list:
     """Bouw de informatie-rijen voor Bijlage 4 / opdrachtbevestiging."""
     items = payload.get("items")
 
     if isinstance(items, list) and items:
-        result = []
+        item_values = {}
+        extra_rows = []
         for item in items:
             if isinstance(item, dict):
-                label = item.get("label") or item.get("name") or item.get("field") or "-"
+                label = str(item.get("label") or item.get("name") or item.get("field") or "-")
                 if should_skip_info_field(label):
                     continue
                 value = item.get("value") if "value" in item else item.get("status", "-")
-                result.append((str(label), clean_value(value)))
+                target_label = INFO_FIELD_ALIASES.get(label.strip().lower(), label)
+                item_values[target_label.strip().lower()] = display_choice_value(value)
             elif isinstance(item, str):
                 if should_skip_info_field(item):
                     continue
-                result.append((item, clean_value(source_fields.get(item))))
-        return result
+                target_label = INFO_FIELD_ALIASES.get(item.strip().lower(), item)
+                item_values[target_label.strip().lower()] = display_choice_value(source_fields.get(item))
+
+        default_rows = []
+        for label in DEFAULT_INFO_ROWS:
+            value = item_values.get(label.lower()) or bijlage4_value_for_label(label, source_fields)
+            default_rows.append((label, value))
+
+        for label_norm, value in item_values.items():
+            if label_norm not in {label.lower() for label in DEFAULT_INFO_ROWS} and value != "-":
+                extra_rows.append((label_norm, value))
+        return default_rows + extra_rows[:20]
 
     if isinstance(items, dict) and items:
-        return [
-            (str(k), clean_value(v))
-            for k, v in items.items()
-            if not should_skip_info_field(k)
-        ]
+        source_fields = {**source_fields, **items}
 
-    # Vaste basisregels bovenaan.
+    # Vaste basisregels bovenaan. Keuzevelden worden in de juiste vaste rij geplaatst.
     default_rows = []
     for label in DEFAULT_INFO_ROWS:
-        default_rows.append((label, clean_value(pick(source_fields, label, default="-"))))
+        default_rows.append((label, bijlage4_value_for_label(label, source_fields)))
 
     # Extra velden die niet technisch zijn en niet al in de vaste regels zitten.
-    existing = {label.lower() for label, _ in default_rows}
     extra_rows = []
     for key, value in source_fields.items():
         key_str = str(key)
-        key_norm = key_str.strip().lower()
-        if key_norm in existing or should_skip_info_field(key_str):
+        if should_skip_extra_info_field(key_str):
             continue
-        if clean_value(value) == "-":
+        readable_value = display_choice_value(value)
+        if readable_value == "-":
             continue
-        extra_rows.append((key_str, clean_value(value)))
+        extra_rows.append((key_str, readable_value))
 
     return default_rows + extra_rows[:20]
 
