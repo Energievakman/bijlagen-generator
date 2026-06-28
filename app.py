@@ -36,7 +36,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-APP_VERSION = "v9_opdrachtbevestiging_echte_branch_zonder_bijlage4_tabel_20260627"
+APP_VERSION = "v10_kolommen_bijlage4_volgorde_20260628"
 
 
 @app.errorhandler(HTTPException)
@@ -100,7 +100,9 @@ DEFAULT_INFO_ROWS = [
     "Installatietekeningen voor koeling",
     "Inregeling verwarming conform protocol",
     "Verzamellijsten opwekkers verwarming",
-    "Verzamellijsten kozijnen en beglazingen",
+    "Verzamellijsten met type kozijnen en beglazingen",
+    "Aanvraag bouwvergunning",
+    "Verleende bouwvergunning",
 ]
 
 INTERNAL_KEYS = {
@@ -617,7 +619,7 @@ def make_opdrachtbevestiging_table(source_fields: dict, styles):
         [Paragraph("Uw adviseur", styles["Small"]), Paragraph(pdf_escape(uw_adviseur), styles["Small"])],
         [Paragraph("Opnamedatum", styles["Small"]), Paragraph(pdf_escape(opnamedatum), styles["Small"])],
     ]
-    table = Table(table_data, colWidths=[95 * mm, 81 * mm], repeatRows=1)
+    table = Table(table_data, colWidths=[48 * mm, 128 * mm], repeatRows=1)
     table.setStyle(TableStyle([
         ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDDDDD")),
         ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEEEEE")),
