@@ -90,16 +90,16 @@ DOCUMENT_CONFIG = {
 
 DEFAULT_INFO_ROWS = [
     "Bouwkundige tekeningen",
+    "Plattegronden",
     "Gevelaanzichten",
     "Doorsnedes",
-    "Plattegronden",
     "Constructietekeningen",
     "Installatieontwerp van het gebouw",
     "Installatietekeningen voor verwarming",
     "Installatietekeningen voor tapwater",
     "Installatietekeningen voor koeling",
     "Inregeling verwarming conform protocol",
-    "Verzamellijsten opwekkers verwarming",
+    "Verzamellijsten opwekkers",
     "Verzamellijsten met type kozijnen en beglazingen",
     "Aanvraag bouwvergunning",
     "Verleende bouwvergunning",
