@@ -90,9 +90,9 @@ DOCUMENT_CONFIG = {
 
 DEFAULT_INFO_ROWS = [
     "Bouwkundige tekeningen",
+    "Plattegronden",
     "Gevelaanzichten",
     "Doorsnedes",
-    "Plattegronden",
     "Constructietekeningen",
     "Installatieontwerp van het gebouw",
     "Installatietekeningen voor verwarming",
