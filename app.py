@@ -36,7 +36,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-APP_VERSION = "v10_kolommen_bijlage4_volgorde_20260628"
+APP_VERSION = "v11_bag_afschrift_endpoint_20260630"
 
 
 @app.errorhandler(HTTPException)
@@ -907,6 +907,300 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
     }
 
 
+
+
+# -----------------------------------------------------------------------------
+# BAG-afschrift generatie
+# -----------------------------------------------------------------------------
+
+BAG_VBO_ENDPOINT = "https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2/verblijfsobjecten/{id}"
+
+
+def first_non_empty(*values, default="-"):
+    for value in values:
+        cleaned = clean_value(value)
+        if cleaned != "-":
+            return cleaned
+    return default
+
+
+def format_m2(value):
+    cleaned = clean_value(value)
+    if cleaned == "-":
+        return "-"
+    text = str(cleaned)
+    if "m²" in text or "m2" in text.lower():
+        return text
+    return f"{text} m²"
+
+
+def bag_get_nested(data, *path, default=""):
+    current = data
+    for part in path:
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+        else:
+            return default
+    return current if current is not None else default
+
+
+def extract_bag_identificatie_from_href(href: str) -> str:
+    if not href:
+        return ""
+    match = re.search(r"/(verblijfsobjecten|nummeraanduidingen|panden)/([^/?#]+)", str(href))
+    return match.group(2) if match else ""
+
+
+def fetch_bag_verblijfsobject(adresseerbaar_object_id: str) -> dict:
+    """Haal BAG-gegevens op via de officiële Kadaster BAG API, indien API-key aanwezig is."""
+    api_key = env("BAG_API_KEY") or env("KADASTER_BAG_API_KEY")
+    if not api_key or not adresseerbaar_object_id:
+        return {}
+
+    url = BAG_VBO_ENDPOINT.format(id=adresseerbaar_object_id.strip())
+    headers = {
+        "X-Api-Key": api_key,
+        "Accept": "application/hal+json",
+        "Accept-Crs": "epsg:28992",
+    }
+    r = requests.get(url, headers=headers, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"BAG API ophalen verblijfsobject mislukt: {r.status_code} {r.text[:1000]}")
+    return r.json()
+
+
+def flatten_bag_data(payload: dict, source_fields: dict, api_data: dict) -> dict:
+    """Maak één nette dictionary voor het BAG-afschrift uit Softr-velden + optionele BAG API-data."""
+    vbo = bag_get_nested(api_data, "verblijfsobject", default={}) if isinstance(api_data, dict) else {}
+    if not isinstance(vbo, dict):
+        vbo = {}
+
+    embedded = api_data.get("_embedded", {}) if isinstance(api_data, dict) else {}
+    panden = embedded.get("panden", []) if isinstance(embedded, dict) else []
+    pand0 = panden[0].get("pand", {}) if panden and isinstance(panden[0], dict) else {}
+
+    nummeraanduiding_id = first_non_empty(
+        pick(source_fields, "nummeraanduiding_id", "Nummeraanduiding ID", "Nummeraanduiding", default=""),
+        extract_bag_identificatie_from_href(bag_get_nested(api_data, "_links", "heeftAlsHoofdAdres", "href", default="")),
+        extract_bag_identificatie_from_href(bag_get_nested(api_data, "_links", "heeftAlsNevenAdres", "href", default="")),
+        default="-",
+    )
+
+    pand_ids_from_api = []
+    for item in panden:
+        if isinstance(item, dict):
+            pand = item.get("pand") or item
+            pid = pand.get("identificatie") or extract_bag_identificatie_from_href(bag_get_nested(item, "_links", "self", "href", default=""))
+            if pid:
+                pand_ids_from_api.append(str(pid))
+
+    pand_ids = first_non_empty(
+        pick(source_fields, "pand_id", "Pand ID", "pand identificatie", "pand_identificatie", default=""),
+        ", ".join(dict.fromkeys(pand_ids_from_api)),
+        default="-",
+    )
+
+    bouwjaar = first_non_empty(
+        pick(source_fields, "bouwjaar", "Bouwjaar", default=""),
+        pand0.get("oorspronkelijkBouwjaar"),
+        default="-",
+    )
+
+    gebruiksdoelen = vbo.get("gebruiksdoelen") or vbo.get("gebruiksdoel") or pick(source_fields, "gebruiksdoel", "Gebruiksdoel", default="")
+    if isinstance(gebruiksdoelen, list):
+        gebruiksdoelen = ", ".join(str(x) for x in gebruiksdoelen)
+
+    status_vbo = vbo.get("status") or pick(source_fields, "status", "Status verblijfsobject", "object_status", default="")
+    status_pand = pand0.get("status") or pick(source_fields, "status_pand", "Status pand", default="")
+
+    return {
+        "adres": first_non_empty(payload.get("adres"), payload.get("address"), pick(source_fields, "Adres (vol)", "Volledig adres", "Adresregel", "Adres", "Address", default="")),
+        "straat": first_non_empty(pick(source_fields, "straat", "Straat", "openbare_ruimte", "Openbare ruimte", default="")),
+        "huisnummer": first_non_empty(pick(source_fields, "huisnummer", "Huisnummer", default="")),
+        "huisletter": first_non_empty(pick(source_fields, "huisletter", "Huisletter", default="")),
+        "toevoeging": first_non_empty(pick(source_fields, "toevoeging", "Huisnummertoevoeging", default="")),
+        "postcode": first_non_empty(payload.get("postcode"), pick(source_fields, "postcode", "Postcode", default="")),
+        "woonplaats": first_non_empty(payload.get("woonplaats"), payload.get("plaats"), pick(source_fields, "woonplaats", "Woonplaats", "plaats", "Plaats", default="")),
+        "gemeente": first_non_empty(pick(source_fields, "gemeente", "Gemeente", default="")),
+        "verblijfsobject_id": first_non_empty(
+            payload.get("adresseerbaar_object_id"), payload.get("verblijfsobject_id"), payload.get("object_id"),
+            pick(source_fields, "adresseerbaar_object_id", "Adresseerbaar object ID", "Adresseerbaar object id", "verblijfsobject_id", "Verblijfsobject ID", "object_id", default=""),
+            vbo.get("identificatie"),
+            default="-",
+        ),
+        "nummeraanduiding_id": nummeraanduiding_id,
+        "pand_id": pand_ids,
+        "bouwjaar": bouwjaar,
+        "gebruiksoppervlakte": first_non_empty(
+            payload.get("gebruiksoppervlakte"), payload.get("oppervlakte"), payload.get("go"),
+            pick(source_fields, "gebruiksoppervlakte", "Gebruiksoppervlakte", "oppervlakte", "Oppervlakte", "go", default=""),
+            vbo.get("oppervlakte"),
+            default="-",
+        ),
+        "gebruiksdoel": first_non_empty(gebruiksdoelen, default="-"),
+        "status_verblijfsobject": first_non_empty(status_vbo, default="-"),
+        "status_pand": first_non_empty(status_pand, default="-"),
+        "documentdatum": now_nl(),
+    }
+
+
+def make_bag_pdf(bag: dict, out_path: Path) -> dict:
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=18 * mm,
+        bottomMargin=15 * mm,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="BagTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=21, leading=25, textColor=colors.HexColor("#12355B")))
+    styles.add(ParagraphStyle(name="BagSub", parent=styles["Normal"], fontName="Helvetica", fontSize=9, leading=12, textColor=colors.HexColor("#666666")))
+    styles.add(ParagraphStyle(name="BagSmall", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=11))
+    styles.add(ParagraphStyle(name="BagSmallBold", parent=styles["BagSmall"], fontName="Helvetica-Bold"))
+    styles.add(ParagraphStyle(name="BagNote", parent=styles["BagSmall"], fontSize=7.5, leading=10, textColor=colors.HexColor("#666666")))
+
+    story = [
+        Paragraph("BAG-afschrift", styles["BagTitle"]),
+        Paragraph("Basisregistratie Adressen en Gebouwen", styles["BagSub"]),
+        Spacer(1, 8 * mm),
+    ]
+
+    header_data = [
+        [Paragraph("Adres", styles["BagSmallBold"]), Paragraph(pdf_escape(bag.get("adres")), styles["BagSmall"])],
+        [Paragraph("Postcode en woonplaats", styles["BagSmallBold"]), Paragraph(pdf_escape(f"{bag.get('postcode', '-')} {bag.get('woonplaats', '-')}").strip(), styles["BagSmall"])],
+        [Paragraph("Datum afschrift", styles["BagSmallBold"]), Paragraph(pdf_escape(bag.get("documentdatum")), styles["BagSmall"])],
+    ]
+    header = Table(header_data, colWidths=[52 * mm, 124 * mm])
+    header.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E2EE")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEF2F6")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F4F8FC")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 7 * mm))
+
+    rows = [
+        ("Verblijfsobject ID", bag.get("verblijfsobject_id")),
+        ("Nummeraanduiding ID", bag.get("nummeraanduiding_id")),
+        ("Pand ID", bag.get("pand_id")),
+        ("Straat", bag.get("straat")),
+        ("Huisnummer", " ".join(x for x in [clean_value(bag.get("huisnummer")), clean_value(bag.get("huisletter")), clean_value(bag.get("toevoeging"))] if x != "-") or "-"),
+        ("Gemeente", bag.get("gemeente")),
+        ("Bouwjaar", bag.get("bouwjaar")),
+        ("Gebruiksoppervlakte", format_m2(bag.get("gebruiksoppervlakte"))),
+        ("Gebruiksdoel", bag.get("gebruiksdoel")),
+        ("Status verblijfsobject", bag.get("status_verblijfsobject")),
+        ("Status pand", bag.get("status_pand")),
+    ]
+    table_data = [[Paragraph("Gegeven", styles["BagSmallBold"]), Paragraph("Waarde", styles["BagSmallBold"])]
+    ] + [[Paragraph(pdf_escape(k), styles["BagSmall"]), Paragraph(pdf_escape(v), styles["BagSmall"])] for k, v in rows]
+    info_table = Table(table_data, colWidths=[62 * mm, 114 * mm], repeatRows=1)
+    info_table.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E2EE")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEF2F6")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#12355B")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(info_table)
+    story.append(Spacer(1, 8 * mm))
+    story.append(Paragraph("Dit afschrift is automatisch samengesteld op basis van de BAG-gegevens die in het dossierrecord aanwezig zijn, eventueel aangevuld met de Kadaster BAG API op basis van het verblijfsobject-ID.", styles["BagNote"]))
+
+    doc.build(story)
+    return {"address": bag.get("adres"), "verblijfsobject_id": bag.get("verblijfsobject_id"), "version": APP_VERSION}
+
+
+def generate_bag_afschrift():
+    payload = get_json_payload()
+    require_secret(payload)
+
+    source_fields = {}
+    source_record_id = payload.get("source_record_id") or payload.get("dossier_record_id") or request.args.get("source_record_id")
+    source_table_id = payload.get("source_table_id") or env("SOFTR_TABLE_DOSSIERS_ID")
+    if source_record_id and source_table_id and truthy_env("BAG_FETCH_SOFTR_RECORD", "false"):
+        source_record = softr_get_record(source_table_id, source_record_id, field_names=True)
+        source_fields.update(source_record.get("fields") or {})
+
+    if isinstance(payload.get("fields"), dict):
+        source_fields.update(payload["fields"])
+    for key, value in payload.items():
+        if key not in INTERNAL_KEYS:
+            source_fields[key] = value
+
+    adresseerbaar_object_id = first_non_empty(
+        payload.get("adresseerbaar_object_id"), payload.get("verblijfsobject_id"), payload.get("object_id"),
+        pick(source_fields, "adresseerbaar_object_id", "Adresseerbaar object ID", "Adresseerbaar object id", "verblijfsobject_id", "Verblijfsobject ID", "object_id", default=""),
+        default="",
+    )
+
+    api_data = {}
+    if truthy_env("BAG_USE_API", "true") and adresseerbaar_object_id:
+        api_data = fetch_bag_verblijfsobject(adresseerbaar_object_id)
+
+    bag = flatten_bag_data(payload, source_fields, api_data)
+    address_for_filename = clean_value(bag.get("adres") or bag.get("verblijfsobject_id") or "bag_afschrift")
+    filename = f"BAG_afschrift_{safe_filename(address_for_filename)}_{uuid.uuid4().hex[:8]}.pdf"
+    pdf_path = TMP_DIR / filename
+    meta = make_bag_pdf(bag, pdf_path)
+    file_url = upload_or_host_pdf(pdf_path, filename)
+
+    dossier_record_id = (
+        payload.get("dossier_record_id")
+        or payload.get("target_record_id")
+        or first_record_id(pick(source_fields, "dossier_record_id", "Dossier record ID", "Dossier Record ID", "Dossier", "Dossier ID"))
+        or source_record_id
+    )
+    target_field_id = env("SOFTR_FIELD_DOSSIER_BAG_AFSCHRIFT_PDF")
+
+    async_update = truthy_env("SOFTR_UPDATE_ASYNC", "true")
+    should_patch = bool(dossier_record_id and target_field_id)
+    if should_patch and async_update:
+        worker = threading.Thread(
+            target=softr_patch_dossier_file_background,
+            args=(dossier_record_id, target_field_id, file_url, filename, "bag_afschrift"),
+            daemon=True,
+        )
+        worker.start()
+        return jsonify({
+            "status": "queued",
+            "document_type": "bag_afschrift",
+            "filename": filename,
+            "file_url": file_url,
+            "dossier_record_id": dossier_record_id,
+            "target_field_id": target_field_id,
+            "softr_update": "background_started",
+            "meta": meta,
+        })
+
+    update_result = None
+    if should_patch:
+        update_result = softr_patch_dossier_file(dossier_record_id, target_field_id, file_url, filename)
+
+    return jsonify({
+        "status": "ok",
+        "document_type": "bag_afschrift",
+        "filename": filename,
+        "file_url": file_url,
+        "dossier_record_id": dossier_record_id,
+        "target_field_id": target_field_id,
+        "softr_update_mode": update_result.get("mode") if update_result else None,
+        "softr_update_assumed_success": update_result.get("assumed_success", False) if update_result else False,
+        "meta": meta,
+    })
+
+
 # -----------------------------------------------------------------------------
 # File hosting / upload
 # -----------------------------------------------------------------------------
@@ -1035,6 +1329,12 @@ def route_generate_opdrachtbevestiging():
     return generate_document("opdrachtbevestiging")
 
 
+@app.route("/generate/bag-afschrift", methods=["POST"])
+@app.route("/generate/bag", methods=["POST"])
+def route_generate_bag_afschrift():
+    return generate_bag_afschrift()
+
+
 @app.route("/generate-document", methods=["POST"])
 def route_generate_document_generic():
     payload = get_json_payload()
@@ -1125,6 +1425,7 @@ def home():
         "endpoints": {
             "bijlage4": "POST /generate/bijlage4",
             "opdrachtbevestiging": "POST /generate/opdrachtbevestiging",
+            "bag_afschrift": "POST /generate/bag-afschrift",
             "generic": "POST /generate-document met document_type",
             "uniec3_legacy": "GET/POST /generate",
         },
