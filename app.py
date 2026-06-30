@@ -40,7 +40,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-APP_VERSION = "v14_bag_afschrift_table_fit_20260630"
+APP_VERSION = "v15_bag_id_autodetect_20260630"
 
 
 @app.errorhandler(HTTPException)
@@ -1007,22 +1007,112 @@ def bag_api_get_object(kind: str, object_id: str) -> dict:
     return bag_api_get(f"{BAG_API_BASE}/{kind}/{object_id}")
 
 
+def bag_kind_from_id(object_id: str) -> str:
+    """Bepaal globaal het BAG-objecttype op basis van de 5e/6e positie.
+
+    BAG-identificaties zijn 16 cijfers. Voor deze generator is vooral het
+    verschil belangrijk tussen verblijfsobjecten (...01...) en
+    nummeraanduidingen (...02...). Bij twijfel proberen we eerst het
+    verblijfsobject-endpoint en vallen we terug op nummeraanduiding.
+    """
+    object_id = clean_bag_id(object_id)
+    if len(object_id) != 16:
+        return "unknown"
+    type_code = object_id[4:6]
+    if type_code == "01":
+        return "verblijfsobject"
+    if type_code == "02":
+        return "nummeraanduiding"
+    if type_code == "10":
+        return "pand"
+    return "unknown"
+
+
+def collect_bag_ids_from_links(data, kind: str) -> list:
+    """Zoek recursief naar BAG-links in een API-response.
+
+    Dit maakt de koppeling robuust, omdat Kadaster per response soms andere
+    rel-namen gebruikt. We zoeken daarom niet op één vaste rel, maar op alle
+    hrefs waarin bijvoorbeeld /verblijfsobjecten/ of /panden/ voorkomt.
+    """
+    found = []
+    pattern = f"/{kind}/"
+
+    def walk(value):
+        if isinstance(value, dict):
+            href = value.get("href")
+            if isinstance(href, str) and pattern in href:
+                bag_id = clean_bag_id(extract_bag_identificatie_from_href(href))
+                if bag_id:
+                    found.append(bag_id)
+            for sub in value.values():
+                walk(sub)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(data)
+    return list(dict.fromkeys(found))
+
+
 def fetch_bag_verblijfsobject(adresseerbaar_object_id: str) -> dict:
-    """Haal verblijfsobject + gekoppelde nummeraanduiding + pand(en) op."""
-    vbo_id = clean_bag_id(adresseerbaar_object_id)
-    if not bag_headers() or not vbo_id:
+    """Haal verblijfsobject + gekoppelde nummeraanduiding + pand(en) op.
+
+    De input mag nu zowel een verblijfsobject-ID (...01...) als een
+    nummeraanduiding-ID (...02...) zijn. Softr/PDOK geeft bij sommige adressen
+    namelijk een nummeraanduiding-ID terug. De Kadaster API accepteert die niet
+    op /verblijfsobjecten/{id}; daarom detecteren we het type en lossen we via
+    de BAG-links het verblijfsobject alsnog op.
+    """
+    object_id = clean_bag_id(adresseerbaar_object_id)
+    if not bag_headers() or not object_id:
         return {}
 
-    result = {"verblijfsobject_response": bag_api_get(BAG_VBO_ENDPOINT.format(id=vbo_id))}
+    result = {}
+    kind = bag_kind_from_id(object_id)
+
+    if kind == "nummeraanduiding":
+        nummer_response = bag_api_get_object("nummeraanduidingen", object_id)
+        result["nummeraanduiding_response"] = nummer_response
+        vbo_ids = collect_bag_ids_from_links(nummer_response, "verblijfsobjecten")
+        if not vbo_ids:
+            # Soms staat het adresseerbare object als identificatie in het object zelf.
+            nummer = unwrap_bag_object(nummer_response, "nummeraanduiding")
+            for key in ("adresseert", "adresseerbaarObject", "verblijfsobject", "identificatieAdresseerbaarObject"):
+                possible = clean_bag_id(nummer.get(key) if isinstance(nummer, dict) else "")
+                if possible and bag_kind_from_id(possible) == "verblijfsobject":
+                    vbo_ids.append(possible)
+        if not vbo_ids:
+            raise RuntimeError(f"BAG API: nummeraanduiding {object_id} opgehaald, maar geen gekoppeld verblijfsobject gevonden")
+        vbo_id = vbo_ids[0]
+    else:
+        vbo_id = object_id
+
+    try:
+        result["verblijfsobject_response"] = bag_api_get(BAG_VBO_ENDPOINT.format(id=vbo_id))
+    except RuntimeError:
+        # Fallback: als het ID toch geen verblijfsobject bleek te zijn, probeer nummeraanduiding.
+        if kind == "unknown":
+            nummer_response = bag_api_get_object("nummeraanduidingen", object_id)
+            result["nummeraanduiding_response"] = nummer_response
+            vbo_ids = collect_bag_ids_from_links(nummer_response, "verblijfsobjecten")
+            if vbo_ids:
+                result["verblijfsobject_response"] = bag_api_get(BAG_VBO_ENDPOINT.format(id=vbo_ids[0]))
+            else:
+                raise
+        else:
+            raise
+
     vbo_response = result["verblijfsobject_response"]
 
-    # Nummeraanduiding via hoofdadres/nevenadres-link.
+    # Nummeraanduiding via hoofdadres/nevenadres-link, tenzij deze al opgehaald is.
     nummeraanduiding_id = first_non_empty(
         extract_bag_identificatie_from_href(bag_get_nested(vbo_response, "_links", "heeftAlsHoofdAdres", "href", default="")),
         extract_bag_identificatie_from_href(bag_get_nested(vbo_response, "_links", "heeftAlsNevenAdres", "href", default="")),
+        collect_bag_ids_from_links(vbo_response, "nummeraanduidingen")[0] if collect_bag_ids_from_links(vbo_response, "nummeraanduidingen") else "",
         default="",
     )
-    if nummeraanduiding_id:
+    if nummeraanduiding_id and not result.get("nummeraanduiding_response"):
         result["nummeraanduiding_response"] = bag_api_get_object("nummeraanduidingen", nummeraanduiding_id)
 
     # Pand(en): soms embedded, soms alleen links.
@@ -1045,6 +1135,8 @@ def fetch_bag_verblijfsobject(adresseerbaar_object_id: str) -> dict:
             if pid:
                 pand_ids.append(pid)
 
+    pand_ids.extend(collect_bag_ids_from_links(vbo_response, "panden"))
+
     result["pand_responses"] = []
     for pid in dict.fromkeys(pand_ids):
         try:
@@ -1052,6 +1144,8 @@ def fetch_bag_verblijfsobject(adresseerbaar_object_id: str) -> dict:
         except Exception as e:
             app.logger.warning("Pand %s kon niet worden opgehaald: %s", pid, e)
 
+    result["input_bag_id"] = object_id
+    result["input_bag_kind"] = kind
     return result
 
 
