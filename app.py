@@ -19,6 +19,10 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+from reportlab.graphics.barcode import qr
+from reportlab.graphics import renderPDF
+from reportlab.graphics.shapes import Drawing
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
@@ -36,7 +40,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-APP_VERSION = "v11_bag_afschrift_endpoint_20260630"
+APP_VERSION = "v12_bag_afschrift_layout_full_20260630"
 
 
 @app.errorhandler(HTTPException)
@@ -913,7 +917,8 @@ def make_pdf(document_type: str, payload: dict, source_fields: dict, output_path
 # BAG-afschrift generatie
 # -----------------------------------------------------------------------------
 
-BAG_VBO_ENDPOINT = "https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2/verblijfsobjecten/{id}"
+BAG_API_BASE = "https://api.bag.kadaster.nl/lvbag/individuelebevragingen/v2"
+BAG_VBO_ENDPOINT = f"{BAG_API_BASE}/verblijfsobjecten/{{id}}"
 
 
 def first_non_empty(*values, default="-"):
@@ -922,6 +927,27 @@ def first_non_empty(*values, default="-"):
         if cleaned != "-":
             return cleaned
     return default
+
+
+def clean_bag_id(value) -> str:
+    """Accepteert Softr-strings, arrays en objecten en haalt een 16-cijferig BAG-ID eruit."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            found = clean_bag_id(item)
+            if found:
+                return found
+        return ""
+    if isinstance(value, dict):
+        for key in ("id", "value", "identificatie", "adresseerbaarobject_id", "adresseerbaar_object_id"):
+            found = clean_bag_id(value.get(key))
+            if found:
+                return found
+        return ""
+    text = str(value).strip()
+    match = re.search(r"\d{16}", text)
+    return match.group(0) if match else ""
 
 
 def format_m2(value):
@@ -949,176 +975,494 @@ def bag_get_nested(data, *path, default=""):
 def extract_bag_identificatie_from_href(href: str) -> str:
     if not href:
         return ""
-    match = re.search(r"/(verblijfsobjecten|nummeraanduidingen|panden)/([^/?#]+)", str(href))
+    match = re.search(r"/(verblijfsobjecten|nummeraanduidingen|panden|openbare-ruimten|woonplaatsen)/([^/?#]+)", str(href))
     return match.group(2) if match else ""
 
 
-def fetch_bag_verblijfsobject(adresseerbaar_object_id: str) -> dict:
-    """Haal BAG-gegevens op via de officiële Kadaster BAG API, indien API-key aanwezig is."""
+def bag_headers():
     api_key = env("BAG_API_KEY") or env("KADASTER_BAG_API_KEY")
-    if not api_key or not adresseerbaar_object_id:
-        return {}
-
-    url = BAG_VBO_ENDPOINT.format(id=adresseerbaar_object_id.strip())
-    headers = {
+    if not api_key:
+        return None
+    return {
         "X-Api-Key": api_key,
         "Accept": "application/hal+json",
         "Accept-Crs": "epsg:28992",
     }
+
+
+def bag_api_get(url: str) -> dict:
+    headers = bag_headers()
+    if not headers:
+        return {}
     r = requests.get(url, headers=headers, timeout=30)
     if not r.ok:
-        raise RuntimeError(f"BAG API ophalen verblijfsobject mislukt: {r.status_code} {r.text[:1000]}")
+        raise RuntimeError(f"BAG API ophalen mislukt: {r.status_code} {r.text[:1000]}")
     return r.json()
 
 
-def flatten_bag_data(payload: dict, source_fields: dict, api_data: dict) -> dict:
-    """Maak één nette dictionary voor het BAG-afschrift uit Softr-velden + optionele BAG API-data."""
-    vbo = bag_get_nested(api_data, "verblijfsobject", default={}) if isinstance(api_data, dict) else {}
-    if not isinstance(vbo, dict):
-        vbo = {}
+def bag_api_get_object(kind: str, object_id: str) -> dict:
+    object_id = clean_bag_id(object_id)
+    if not object_id:
+        return {}
+    return bag_api_get(f"{BAG_API_BASE}/{kind}/{object_id}")
 
-    embedded = api_data.get("_embedded", {}) if isinstance(api_data, dict) else {}
-    panden = embedded.get("panden", []) if isinstance(embedded, dict) else []
-    pand0 = panden[0].get("pand", {}) if panden and isinstance(panden[0], dict) else {}
+
+def fetch_bag_verblijfsobject(adresseerbaar_object_id: str) -> dict:
+    """Haal verblijfsobject + gekoppelde nummeraanduiding + pand(en) op."""
+    vbo_id = clean_bag_id(adresseerbaar_object_id)
+    if not bag_headers() or not vbo_id:
+        return {}
+
+    result = {"verblijfsobject_response": bag_api_get(BAG_VBO_ENDPOINT.format(id=vbo_id))}
+    vbo_response = result["verblijfsobject_response"]
+
+    # Nummeraanduiding via hoofdadres/nevenadres-link.
+    nummeraanduiding_id = first_non_empty(
+        extract_bag_identificatie_from_href(bag_get_nested(vbo_response, "_links", "heeftAlsHoofdAdres", "href", default="")),
+        extract_bag_identificatie_from_href(bag_get_nested(vbo_response, "_links", "heeftAlsNevenAdres", "href", default="")),
+        default="",
+    )
+    if nummeraanduiding_id:
+        result["nummeraanduiding_response"] = bag_api_get_object("nummeraanduidingen", nummeraanduiding_id)
+
+    # Pand(en): soms embedded, soms alleen links.
+    pand_ids = []
+    embedded_panden = bag_get_nested(vbo_response, "_embedded", "panden", default=[])
+    if isinstance(embedded_panden, list):
+        for item in embedded_panden:
+            pid = clean_bag_id(bag_get_nested(item, "pand", "identificatie", default=""))
+            if not pid:
+                pid = clean_bag_id(extract_bag_identificatie_from_href(bag_get_nested(item, "_links", "self", "href", default="")))
+            if pid:
+                pand_ids.append(pid)
+
+    links = bag_get_nested(vbo_response, "_links", "maaktDeelUitVan", default=[])
+    if isinstance(links, dict):
+        links = [links]
+    if isinstance(links, list):
+        for link in links:
+            pid = clean_bag_id(extract_bag_identificatie_from_href(link.get("href") if isinstance(link, dict) else ""))
+            if pid:
+                pand_ids.append(pid)
+
+    result["pand_responses"] = []
+    for pid in dict.fromkeys(pand_ids):
+        try:
+            result["pand_responses"].append(bag_api_get_object("panden", pid))
+        except Exception as e:
+            app.logger.warning("Pand %s kon niet worden opgehaald: %s", pid, e)
+
+    return result
+
+
+def unwrap_bag_object(response: dict, object_key: str) -> dict:
+    if not isinstance(response, dict):
+        return {}
+    obj = response.get(object_key)
+    return obj if isinstance(obj, dict) else response
+
+
+def fetch_linked_name(response: dict, rel: str, object_key: str, name_keys: tuple) -> str:
+    href = bag_get_nested(response, "_links", rel, "href", default="")
+    if not href or not bag_headers():
+        return ""
+    try:
+        data = bag_api_get(href if str(href).startswith("http") else f"{BAG_API_BASE}{href}")
+        obj = unwrap_bag_object(data, object_key)
+        return first_non_empty(*[obj.get(k) for k in name_keys], default="")
+    except Exception as e:
+        app.logger.warning("Gekoppelde BAG-link %s kon niet worden opgehaald: %s", rel, e)
+        return ""
+
+
+def format_date_bag(value):
+    cleaned = clean_value(value)
+    if cleaned == "-":
+        return "-"
+    text = str(cleaned)[:10]
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        y, m, d = text.split("-")
+        return f"{d}-{m}-{y}"
+    return cleaned
+
+
+def flatten_bag_data(payload: dict, source_fields: dict, api_data: dict) -> dict:
+    """Maak één nette dictionary voor het BAG-afschrift uit Softr + BAG API."""
+    vbo_response = api_data.get("verblijfsobject_response") if isinstance(api_data, dict) else {}
+    # Backwards compatible met oude fetch die direct de vbo-response teruggaf.
+    if not vbo_response and isinstance(api_data, dict) and ("verblijfsobject" in api_data or "_links" in api_data):
+        vbo_response = api_data
+    nummer_response = api_data.get("nummeraanduiding_response", {}) if isinstance(api_data, dict) else {}
+    pand_responses = api_data.get("pand_responses", []) if isinstance(api_data, dict) else []
+
+    vbo = unwrap_bag_object(vbo_response, "verblijfsobject")
+    nummer = unwrap_bag_object(nummer_response, "nummeraanduiding")
+    pand_objects = [unwrap_bag_object(p, "pand") for p in pand_responses if isinstance(p, dict)]
+    pand0 = pand_objects[0] if pand_objects else {}
+
+    # Als oude API-response embedded panden bevatte.
+    if not pand0:
+        embedded = vbo_response.get("_embedded", {}) if isinstance(vbo_response, dict) else {}
+        panden = embedded.get("panden", []) if isinstance(embedded, dict) else []
+        pand0 = panden[0].get("pand", {}) if panden and isinstance(panden[0], dict) else {}
+
+    verblijfsobject_id = first_non_empty(
+        payload.get("adresseerbaar_object_id"), payload.get("verblijfsobject_id"), payload.get("object_id"),
+        pick(source_fields, "adresseerbaar_object_id", "adresseerbaarobject_id", "Adresseerbaar object ID", "Adresseerbaar object id", "verblijfsobject_id", "Verblijfsobject ID", "object_id", default=""),
+        vbo.get("identificatie"),
+        default="-",
+    )
+    verblijfsobject_id = clean_bag_id(verblijfsobject_id) or clean_value(verblijfsobject_id)
 
     nummeraanduiding_id = first_non_empty(
-        pick(source_fields, "nummeraanduiding_id", "Nummeraanduiding ID", "Nummeraanduiding", default=""),
-        extract_bag_identificatie_from_href(bag_get_nested(api_data, "_links", "heeftAlsHoofdAdres", "href", default="")),
-        extract_bag_identificatie_from_href(bag_get_nested(api_data, "_links", "heeftAlsNevenAdres", "href", default="")),
+        nummer.get("identificatie"),
+        pick(source_fields, "nummeraanduiding_id", "nummeraanduidingid", "Nummeraanduiding ID", "Nummeraanduiding", default=""),
+        extract_bag_identificatie_from_href(bag_get_nested(vbo_response, "_links", "heeftAlsHoofdAdres", "href", default="")),
         default="-",
     )
 
-    pand_ids_from_api = []
-    for item in panden:
-        if isinstance(item, dict):
-            pand = item.get("pand") or item
-            pid = pand.get("identificatie") or extract_bag_identificatie_from_href(bag_get_nested(item, "_links", "self", "href", default=""))
-            if pid:
-                pand_ids_from_api.append(str(pid))
-
-    pand_ids = first_non_empty(
+    pand_ids = [clean_bag_id(p.get("identificatie")) for p in pand_objects if p.get("identificatie")]
+    pand_id = first_non_empty(
         pick(source_fields, "pand_id", "Pand ID", "pand identificatie", "pand_identificatie", default=""),
-        ", ".join(dict.fromkeys(pand_ids_from_api)),
+        ", ".join([p for p in dict.fromkeys(pand_ids) if p]),
         default="-",
     )
 
-    bouwjaar = first_non_empty(
-        pick(source_fields, "bouwjaar", "Bouwjaar", default=""),
-        pand0.get("oorspronkelijkBouwjaar"),
+    openbare_ruimte = first_non_empty(
+        nummer.get("_embedded", {}).get("openbareRuimte", {}).get("naam") if isinstance(nummer.get("_embedded"), dict) else "",
+        pick(source_fields, "straat", "Straat", "openbare_ruimte", "Openbare ruimte", "straatnaam", "straatnaam_verkort", default=""),
+        fetch_linked_name(nummer_response, "ligtAanOpenbareRuimte", "openbareRuimte", ("naam", "verkorteNaam")),
         default="-",
     )
+    woonplaats = first_non_empty(
+        payload.get("woonplaats"), payload.get("plaats"),
+        pick(source_fields, "woonplaats", "Woonplaats", "plaats", "Plaats", "woonplaatsnaam", default=""),
+        fetch_linked_name(nummer_response, "ligtInWoonplaats", "woonplaats", ("naam",)),
+        default="-",
+    )
+    gemeente = first_non_empty(
+        pick(source_fields, "gemeente", "Gemeente", "gemeentenaam", default=""),
+        default="-",
+    )
+
+    huisnummer = first_non_empty(nummer.get("huisnummer"), pick(source_fields, "huisnummer", "Huisnummer", default=""), default="-")
+    huisletter = first_non_empty(nummer.get("huisletter"), pick(source_fields, "huisletter", "Huisletter", default=""), default="-")
+    toevoeging = first_non_empty(nummer.get("huisnummertoevoeging"), pick(source_fields, "toevoeging", "huisnummertoevoeging", "Huisnummertoevoeging", default=""), default="-")
+    postcode = first_non_empty(payload.get("postcode"), nummer.get("postcode"), pick(source_fields, "postcode", "Postcode", default=""), default="-")
+
+    adres_parts = [openbare_ruimte, huisnummer]
+    if clean_value(huisletter) != "-":
+        adres_parts.append(huisletter)
+    if clean_value(toevoeging) != "-":
+        adres_parts.append(toevoeging)
+    adres_from_parts = " ".join([clean_value(x) for x in adres_parts if clean_value(x) != "-"])
+    adres = first_non_empty(payload.get("adres"), payload.get("address"), pick(source_fields, "Adres (vol)", "Volledig adres", "Adresregel", "Adres", "Address", "weergavenaam", default=""), adres_from_parts, default="-")
 
     gebruiksdoelen = vbo.get("gebruiksdoelen") or vbo.get("gebruiksdoel") or pick(source_fields, "gebruiksdoel", "Gebruiksdoel", default="")
     if isinstance(gebruiksdoelen, list):
         gebruiksdoelen = ", ".join(str(x) for x in gebruiksdoelen)
 
-    status_vbo = vbo.get("status") or pick(source_fields, "status", "Status verblijfsobject", "object_status", default="")
-    status_pand = pand0.get("status") or pick(source_fields, "status_pand", "Status pand", default="")
+    begin_geldigheid_vbo = first_non_empty(
+        bag_get_nested(vbo, "voorkomen", "beginGeldigheid", default=""), vbo.get("beginGeldigheid"),
+        pick(source_fields, "begindatum_geldigheid", "Begindatum geldigheid", default=""),
+        default="-",
+    )
+    begin_geldigheid_pand = first_non_empty(
+        bag_get_nested(pand0, "voorkomen", "beginGeldigheid", default=""), pand0.get("beginGeldigheid"), begin_geldigheid_vbo,
+        default="-",
+    )
+
+    coords = first_non_empty(
+        pick(source_fields, "centroide_ll", "centroide_rd", "geometrie_ll", "geometrie_rd", default=""),
+        bag_get_nested(vbo, "geometrie", "punt", "coordinates", default=""),
+        default="",
+    )
 
     return {
-        "adres": first_non_empty(payload.get("adres"), payload.get("address"), pick(source_fields, "Adres (vol)", "Volledig adres", "Adresregel", "Adres", "Address", default="")),
-        "straat": first_non_empty(pick(source_fields, "straat", "Straat", "openbare_ruimte", "Openbare ruimte", default="")),
-        "huisnummer": first_non_empty(pick(source_fields, "huisnummer", "Huisnummer", default="")),
-        "huisletter": first_non_empty(pick(source_fields, "huisletter", "Huisletter", default="")),
-        "toevoeging": first_non_empty(pick(source_fields, "toevoeging", "Huisnummertoevoeging", default="")),
-        "postcode": first_non_empty(payload.get("postcode"), pick(source_fields, "postcode", "Postcode", default="")),
-        "woonplaats": first_non_empty(payload.get("woonplaats"), payload.get("plaats"), pick(source_fields, "woonplaats", "Woonplaats", "plaats", "Plaats", default="")),
-        "gemeente": first_non_empty(pick(source_fields, "gemeente", "Gemeente", default="")),
-        "verblijfsobject_id": first_non_empty(
-            payload.get("adresseerbaar_object_id"), payload.get("verblijfsobject_id"), payload.get("object_id"),
-            pick(source_fields, "adresseerbaar_object_id", "Adresseerbaar object ID", "Adresseerbaar object id", "verblijfsobject_id", "Verblijfsobject ID", "object_id", default=""),
-            vbo.get("identificatie"),
-            default="-",
-        ),
-        "nummeraanduiding_id": nummeraanduiding_id,
-        "pand_id": pand_ids,
-        "bouwjaar": bouwjaar,
-        "gebruiksoppervlakte": first_non_empty(
-            payload.get("gebruiksoppervlakte"), payload.get("oppervlakte"), payload.get("go"),
-            pick(source_fields, "gebruiksoppervlakte", "Gebruiksoppervlakte", "oppervlakte", "Oppervlakte", "go", default=""),
-            vbo.get("oppervlakte"),
-            default="-",
-        ),
-        "gebruiksdoel": first_non_empty(gebruiksdoelen, default="-"),
-        "status_verblijfsobject": first_non_empty(status_vbo, default="-"),
-        "status_pand": first_non_empty(status_pand, default="-"),
+        "afschriftnummer": payload.get("afschriftnummer") or f"{datetime.now().strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:4]}",
         "documentdatum": now_nl(),
+        "tijdstip": datetime.now().strftime("%H:%M:%S"),
+        "bron": "BAG API Individuele Bevragingen",
+        "aanvrager": env("BAG_AANVRAGER", "Mijn Portaal B.V."),
+        "adres": adres,
+        "straat": openbare_ruimte,
+        "openbare_ruimte": openbare_ruimte,
+        "huisnummer": huisnummer,
+        "huisletter": huisletter,
+        "toevoeging": toevoeging,
+        "postcode": postcode,
+        "woonplaats": woonplaats,
+        "gemeente": gemeente,
+        "status_nummeraanduiding": first_non_empty(nummer.get("status"), pick(source_fields, "status_nummeraanduiding", default=""), default="-"),
+        "type_nummeraanduiding": first_non_empty(nummer.get("typeAdresseerbaarObject"), "Verblijfsobjectnummer", default="-"),
+        "geconstateerd_nummeraanduiding": first_non_empty(nummer.get("geconstateerd"), default="Nee"),
+        "in_onderzoek_nummeraanduiding": first_non_empty(nummer.get("inOnderzoek"), default="Nee"),
+        "datum_naamgeving": format_date_bag(begin_geldigheid_vbo),
+        "verblijfsobject_id": verblijfsobject_id,
+        "nummeraanduiding_id": clean_bag_id(nummeraanduiding_id) or clean_value(nummeraanduiding_id),
+        "pand_id": pand_id,
+        "bouwjaar": first_non_empty(pand0.get("oorspronkelijkBouwjaar"), pick(source_fields, "bouwjaar", "Bouwjaar", default=""), default="-"),
+        "gebruiksoppervlakte": first_non_empty(payload.get("gebruiksoppervlakte"), payload.get("oppervlakte"), payload.get("go"), pick(source_fields, "gebruiksoppervlakte", "Gebruiksoppervlakte", "oppervlakte", "Oppervlakte", "go", default=""), vbo.get("oppervlakte"), default="-"),
+        "gebruiksdoel": first_non_empty(gebruiksdoelen, default="-"),
+        "status_verblijfsobject": first_non_empty(vbo.get("status"), pick(source_fields, "status", "Status verblijfsobject", "object_status", default=""), default="-"),
+        "status_pand": first_non_empty(pand0.get("status"), pick(source_fields, "status_pand", "Status pand", default=""), default="-"),
+        "pand_oppervlakte": first_non_empty(pand0.get("oppervlakte"), pick(source_fields, "pand_oppervlakte", "Pand oppervlakte", default=""), default="-"),
+        "aantal_bouwlagen": first_non_empty(pand0.get("aantalBouwlagen"), pick(source_fields, "aantal_bouwlagen", "Aantal bouwlagen", default=""), default="-"),
+        "aantal_verblijfsobjecten": first_non_empty(pick(source_fields, "aantal_verblijfsobjecten", "Aantal verblijfsobjecten", default=""), default="1"),
+        "aantal_gebruiksdoelen": first_non_empty(str(len([x for x in str(gebruiksdoelen).split(',') if x.strip()])) if gebruiksdoelen else "", default="1"),
+        "begin_geldigheid_vbo": format_date_bag(begin_geldigheid_vbo),
+        "begin_geldigheid_pand": format_date_bag(begin_geldigheid_pand),
+        "eind_geldigheid_vbo": "-",
+        "eind_geldigheid_pand": "-",
+        "coords": coords,
     }
 
 
+def draw_wrapped(c, text, x, y, max_width, font="Helvetica", size=8.2, leading=11, bold=False):
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    text = clean_value(text)
+    font_name = "Helvetica-Bold" if bold else font
+    words = str(text).split()
+    lines = []
+    line = ""
+    for word in words:
+        trial = f"{line} {word}".strip()
+        if stringWidth(trial, font_name, size) <= max_width or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    c.setFont(font_name, size)
+    for i, line in enumerate(lines[:3]):
+        c.drawString(x, y - i * leading, line)
+    return y - max(1, len(lines[:3])) * leading
+
+
+def draw_section_title(c, title, x, y, w):
+    blue = colors.HexColor("#00508F")
+    c.setFillColor(blue)
+    c.setFont("Helvetica-Bold", 9.2)
+    c.drawString(x, y, title)
+    c.setStrokeColor(blue)
+    c.setLineWidth(0.9)
+    c.line(x, y - 4, x + w, y - 4)
+    c.setFillColor(colors.black)
+
+
+def draw_label_value_rows(c, rows, x, y, label_w=42*mm, row_h=14, font_size=7.4, value_bold=False):
+    for label, value in rows:
+        c.setFillColor(colors.HexColor("#4B5563"))
+        c.setFont("Helvetica", font_size)
+        c.drawString(x, y, clean_value(label))
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold" if value_bold else "Helvetica", font_size)
+        c.drawString(x + label_w, y, clean_value(value))
+        y -= row_h
+    return y
+
+
+def draw_box_table(c, title, rows, x, y, w, row_h=14, label_w=None):
+    if label_w is None:
+        label_w = w * 0.45
+    blue = colors.HexColor("#00508F")
+    border = colors.HexColor("#1F5E95")
+    fill = colors.HexColor("#F3F8FC")
+    c.setStrokeColor(border)
+    c.setLineWidth(0.7)
+    total_h = 22 + row_h * len(rows)
+    c.roundRect(x, y - total_h, w, total_h, 3, stroke=1, fill=0)
+    c.setFillColor(blue)
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(x + 7, y - 14, title)
+    c.setStrokeColor(colors.HexColor("#D6E2ED"))
+    c.line(x + 7, y - 20, x + w - 7, y - 20)
+    cur_y = y - 33
+    for i, (label, value) in enumerate(rows):
+        if i % 2 == 1:
+            c.setFillColor(fill)
+            c.rect(x + 1, cur_y - 4, w - 2, row_h, stroke=0, fill=1)
+        c.setFillColor(colors.HexColor("#4B5563"))
+        c.setFont("Helvetica", 7.2)
+        c.drawString(x + 7, cur_y, clean_value(label))
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold" if i == 0 else "Helvetica", 7.2)
+        draw_wrapped(c, value, x + label_w, cur_y, w - label_w - 8, size=7.2, leading=8.5, bold=(i == 0))
+        cur_y -= row_h
+    return y - total_h
+
+
+def draw_placeholder_map(c, bag, x, y, w, h):
+    c.setStrokeColor(colors.HexColor("#1F5E95"))
+    c.setLineWidth(0.7)
+    c.roundRect(x, y - h, w, h, 3, stroke=1, fill=0)
+    c.setFillColor(colors.HexColor("#00508F"))
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(x + 7, y - 14, "Ligging in Nederland")
+    inner_x, inner_y, inner_w, inner_h = x + 7, y - h + 7, w - 14, h - 29
+    c.setFillColor(colors.HexColor("#EEF3F4"))
+    c.rect(inner_x, inner_y, inner_w, inner_h, stroke=0, fill=1)
+    c.setStrokeColor(colors.HexColor("#D6D6D6"))
+    for i in range(6):
+        c.line(inner_x, inner_y + i * inner_h / 5, inner_x + inner_w, inner_y + (i + 0.7) * inner_h / 5)
+        c.line(inner_x + i * inner_w / 5, inner_y, inner_x + (i + 0.8) * inner_w / 5, inner_y + inner_h)
+    # Pin
+    px, py = inner_x + inner_w * 0.55, inner_y + inner_h * 0.47
+    c.setFillColor(colors.HexColor("#1686C4"))
+    c.circle(px, py + 8, 7, stroke=0, fill=1)
+    c.setFillColor(colors.white)
+    c.circle(px, py + 8, 2.5, stroke=0, fill=1)
+    c.setFillColor(colors.HexColor("#1686C4"))
+    pth = c.beginPath()
+    pth.moveTo(px - 5, py + 4)
+    pth.lineTo(px + 5, py + 4)
+    pth.lineTo(px, py - 8)
+    pth.close()
+    c.drawPath(pth, stroke=0, fill=1)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.setFont("Helvetica", 6.2)
+    c.drawRightString(inner_x + inner_w - 3, inner_y + 3, "© OpenStreetMap contributors")
+
+
+def draw_qr(c, value, x, y, size=31*mm):
+    c.setStrokeColor(colors.HexColor("#8AA8C5"))
+    c.roundRect(x, y - size, size, size, 3, stroke=1, fill=0)
+    qr_code = qr.QrCodeWidget(value or "BAG afschrift")
+    bounds = qr_code.getBounds()
+    width = bounds[2] - bounds[0]
+    height = bounds[3] - bounds[1]
+    d = Drawing(size - 14, size - 14, transform=[(size - 14) / width, 0, 0, (size - 14) / height, 0, 0])
+    d.add(qr_code)
+    renderPDF.draw(d, c, x + 7, y - size + 7)
+
+
 def make_bag_pdf(bag: dict, out_path: Path) -> dict:
-    doc = SimpleDocTemplate(
-        str(out_path),
-        pagesize=A4,
-        rightMargin=16 * mm,
-        leftMargin=16 * mm,
-        topMargin=18 * mm,
-        bottomMargin=15 * mm,
-    )
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="BagTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=21, leading=25, textColor=colors.HexColor("#12355B")))
-    styles.add(ParagraphStyle(name="BagSub", parent=styles["Normal"], fontName="Helvetica", fontSize=9, leading=12, textColor=colors.HexColor("#666666")))
-    styles.add(ParagraphStyle(name="BagSmall", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=11))
-    styles.add(ParagraphStyle(name="BagSmallBold", parent=styles["BagSmall"], fontName="Helvetica-Bold"))
-    styles.add(ParagraphStyle(name="BagNote", parent=styles["BagSmall"], fontSize=7.5, leading=10, textColor=colors.HexColor("#666666")))
+    """Maak een BAG-afschrift in de layout van het voorbeeld."""
+    c = canvas.Canvas(str(out_path), pagesize=A4)
+    W, H = A4
+    margin = 16 * mm
+    blue = colors.HexColor("#00508F")
 
-    story = [
-        Paragraph("BAG-afschrift", styles["BagTitle"]),
-        Paragraph("Basisregistratie Adressen en Gebouwen", styles["BagSub"]),
-        Spacer(1, 8 * mm),
-    ]
+    # Header
+    c.setFillColor(colors.HexColor("#123A63"))
+    c.setFont("Helvetica-Bold", 23)
+    c.drawString(margin, H - 33 * mm, "BAG AFSCHRIFT")
+    c.setFillColor(colors.HexColor("#374151"))
+    c.setFont("Helvetica", 11)
+    c.drawString(margin, H - 43 * mm, "Basisregistratie Adressen en Gebouwen (BAG)")
 
-    header_data = [
-        [Paragraph("Adres", styles["BagSmallBold"]), Paragraph(pdf_escape(bag.get("adres")), styles["BagSmall"])],
-        [Paragraph("Postcode en woonplaats", styles["BagSmallBold"]), Paragraph(pdf_escape(f"{bag.get('postcode', '-')} {bag.get('woonplaats', '-')}").strip(), styles["BagSmall"])],
-        [Paragraph("Datum afschrift", styles["BagSmallBold"]), Paragraph(pdf_escape(bag.get("documentdatum")), styles["BagSmall"])],
-    ]
-    header = Table(header_data, colWidths=[52 * mm, 124 * mm])
-    header.setStyle(TableStyle([
-        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E2EE")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEF2F6")),
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F4F8FC")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(header)
-    story.append(Spacer(1, 7 * mm))
+    # Tekstlogo rechtsboven. Geen officieel beeldmerkbestand nodig.
+    c.setFillColor(colors.HexColor("#0085B2"))
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(W - 50 * mm, H - 30 * mm, "kadaster")
+    c.setFillColor(colors.HexColor("#0077A8"))
+    p = c.beginPath()
+    p.moveTo(W - 35 * mm, H - 27 * mm)
+    p.lineTo(W - 23 * mm, H - 27 * mm)
+    p.lineTo(W - 44 * mm, H - 58 * mm)
+    p.close()
+    c.drawPath(p, stroke=0, fill=1)
+    c.setFillColor(colors.HexColor("#00508F"))
+    p = c.beginPath()
+    p.moveTo(W - 20 * mm, H - 27 * mm)
+    p.lineTo(W - 15 * mm, H - 27 * mm)
+    p.lineTo(W - 31 * mm, H - 58 * mm)
+    p.lineTo(W - 36 * mm, H - 58 * mm)
+    p.close()
+    c.drawPath(p, stroke=0, fill=1)
 
-    rows = [
-        ("Verblijfsobject ID", bag.get("verblijfsobject_id")),
-        ("Nummeraanduiding ID", bag.get("nummeraanduiding_id")),
-        ("Pand ID", bag.get("pand_id")),
-        ("Straat", bag.get("straat")),
-        ("Huisnummer", " ".join(x for x in [clean_value(bag.get("huisnummer")), clean_value(bag.get("huisletter")), clean_value(bag.get("toevoeging"))] if x != "-") or "-"),
+    # Linker adresblok
+    left_x = margin
+    top_y = H - 62 * mm
+    draw_section_title(c, "Adres", left_x, top_y, 86 * mm)
+    adres_rows = [
+        ("Adres", bag.get("adres")),
+        ("Postcode", bag.get("postcode")),
+        ("Woonplaats", bag.get("woonplaats")),
         ("Gemeente", bag.get("gemeente")),
-        ("Bouwjaar", bag.get("bouwjaar")),
-        ("Gebruiksoppervlakte", format_m2(bag.get("gebruiksoppervlakte"))),
-        ("Gebruiksdoel", bag.get("gebruiksdoel")),
-        ("Status verblijfsobject", bag.get("status_verblijfsobject")),
-        ("Status pand", bag.get("status_pand")),
+        ("Openbare ruimte", bag.get("openbare_ruimte")),
+        ("Huisnummer", bag.get("huisnummer")),
+        ("Huisletter", bag.get("huisletter")),
+        ("Huisnummertoevoeging", bag.get("toevoeging")),
+        ("Status", bag.get("status_nummeraanduiding")),
+        ("Datum naamgeving", bag.get("datum_naamgeving")),
+        ("Datum beëindiging", "-"),
     ]
-    table_data = [[Paragraph("Gegeven", styles["BagSmallBold"]), Paragraph("Waarde", styles["BagSmallBold"])]
-    ] + [[Paragraph(pdf_escape(k), styles["BagSmall"]), Paragraph(pdf_escape(v), styles["BagSmall"])] for k, v in rows]
-    info_table = Table(table_data, colWidths=[62 * mm, 114 * mm], repeatRows=1)
-    info_table.setStyle(TableStyle([
-        ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E2EE")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#EEF2F6")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#12355B")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(info_table)
-    story.append(Spacer(1, 8 * mm))
-    story.append(Paragraph("Dit afschrift is automatisch samengesteld op basis van de BAG-gegevens die in het dossierrecord aanwezig zijn, eventueel aangevuld met de Kadaster BAG API op basis van het verblijfsobject-ID.", styles["BagNote"]))
+    draw_label_value_rows(c, adres_rows, left_x, top_y - 16, label_w=33 * mm, row_h=13.2, font_size=7.4, value_bold=True)
 
-    doc.build(story)
+    # Rechter metadata + kaart
+    meta_x = W - margin - 89 * mm
+    meta_y = top_y + 1
+    meta_rows = [
+        ("Afschriftnummer", bag.get("afschriftnummer")),
+        ("Datum afschrift", bag.get("documentdatum")),
+        ("Tijdstip", bag.get("tijdstip")),
+        ("Bron", bag.get("bron")),
+        ("Aanvrager", bag.get("aanvrager")),
+    ]
+    draw_label_value_rows(c, meta_rows, meta_x, meta_y, label_w=36 * mm, row_h=14, font_size=7.3, value_bold=True)
+    draw_placeholder_map(c, bag, meta_x, H - 118 * mm, 89 * mm, 54 * mm)
+
+    # Nummeraanduiding breed
+    y = H - 237 * mm
+    # Actually use absolute placement similar to sample.
+    num_y = H - 123 * mm
+    draw_box_table(c, "Nummeraanduiding", [
+        ("Nummeraanduiding ID", bag.get("nummeraanduiding_id")),
+        ("Type nummeraanduiding", bag.get("type_nummeraanduiding")),
+        ("Status", bag.get("status_nummeraanduiding")),
+        ("Geconstateerd", bag.get("geconstateerd_nummeraanduiding")),
+        ("Begindatum geldigheid", bag.get("begin_geldigheid_vbo")),
+        ("Einddatum geldigheid", "-"),
+        ("In onderzoek", bag.get("in_onderzoek_nummeraanduiding")),
+    ], margin, num_y, W - 2 * margin, row_h=12.7, label_w=55 * mm)
+
+    # Onderste kolommen
+    col_y = H - 174 * mm
+    col_w = (W - 2 * margin - 6 * mm) / 2
+    draw_box_table(c, "Adresseerbaar object", [
+        ("Adresseerbaar object ID", bag.get("verblijfsobject_id")),
+        ("Type adresseerbaar object", "Verblijfsobject"),
+        ("Status", bag.get("status_verblijfsobject")),
+        ("Gebruiksdoel", bag.get("gebruiksdoel")),
+        ("Oppervlakte gebruiksdoel (m²)", clean_value(bag.get("gebruiksoppervlakte")).replace(" m²", "")),
+        ("Vloeroppervlakte (m²)", clean_value(bag.get("gebruiksoppervlakte")).replace(" m²", "")),
+        ("Aantal verblijfsobjecten", bag.get("aantal_verblijfsobjecten")),
+        ("Aantal gebruiksdoelen", bag.get("aantal_gebruiksdoelen")),
+        ("Pand ID", bag.get("pand_id")),
+        ("Begindatum geldigheid", bag.get("begin_geldigheid_vbo")),
+        ("Einddatum geldigheid", bag.get("eind_geldigheid_vbo")),
+    ], margin, col_y, col_w, row_h=11.7, label_w=42 * mm)
+
+    right_x = margin + col_w + 6 * mm
+    pand_bottom = draw_box_table(c, "Pand", [
+        ("Pand ID", bag.get("pand_id")),
+        ("Status", bag.get("status_pand")),
+        ("Bouwjaar", bag.get("bouwjaar")),
+        ("Gebruiksdoel", bag.get("gebruiksdoel")),
+        ("Oppervlakte (m²)", clean_value(bag.get("pand_oppervlakte")).replace(" m²", "")),
+        ("Aantal bouwlagen", bag.get("aantal_bouwlagen")),
+        ("Begindatum geldigheid", bag.get("begin_geldigheid_pand")),
+        ("Einddatum geldigheid", bag.get("eind_geldigheid_pand")),
+    ], right_x, col_y, col_w, row_h=12.3, label_w=42 * mm)
+
+    draw_box_table(c, "Standplaats", [("Er is geen standplaats geregistreerd voor dit adres.", "")], right_x, pand_bottom - 6 * mm, col_w, row_h=15, label_w=col_w - 14)
+
+    # Overig + QR
+    overig_y = 47 * mm
+    overig_w = W - 2 * margin - 63 * mm
+    draw_box_table(c, "Overig", [
+        ("Gerelateerde objecten", "Zie BAG Viewer of API response voor alle relaties"),
+        ("Opmerkingen", "Dit afschrift is automatisch gegenereerd op basis van BAG API Individuele Bevragingen."),
+    ], margin, overig_y, overig_w, row_h=18, label_w=38 * mm)
+    qr_value = f"BAG afschrift | {bag.get('adres')} | VBO {bag.get('verblijfsobject_id')}"
+    draw_qr(c, qr_value, W - margin - 31 * mm, overig_y, size=31 * mm)
+
+    c.setFillColor(colors.HexColor("#4B5563"))
+    c.setFont("Helvetica", 7)
+    c.drawString(margin, 10 * mm, "Dit afschrift is geen officieel bewijsstuk. Raadpleeg het Kadaster voor juridische informatie.")
+    c.save()
     return {"address": bag.get("adres"), "verblijfsobject_id": bag.get("verblijfsobject_id"), "version": APP_VERSION}
 
 
@@ -1129,7 +1473,7 @@ def generate_bag_afschrift():
     source_fields = {}
     source_record_id = payload.get("source_record_id") or payload.get("dossier_record_id") or request.args.get("source_record_id")
     source_table_id = payload.get("source_table_id") or env("SOFTR_TABLE_DOSSIERS_ID")
-    if source_record_id and source_table_id and truthy_env("BAG_FETCH_SOFTR_RECORD", "false"):
+    if source_record_id and source_table_id and truthy_env("BAG_FETCH_SOFTR_RECORD", "true"):
         source_record = softr_get_record(source_table_id, source_record_id, field_names=True)
         source_fields.update(source_record.get("fields") or {})
 
@@ -1141,9 +1485,10 @@ def generate_bag_afschrift():
 
     adresseerbaar_object_id = first_non_empty(
         payload.get("adresseerbaar_object_id"), payload.get("verblijfsobject_id"), payload.get("object_id"),
-        pick(source_fields, "adresseerbaar_object_id", "Adresseerbaar object ID", "Adresseerbaar object id", "verblijfsobject_id", "Verblijfsobject ID", "object_id", default=""),
+        pick(source_fields, "adresseerbaar_object_id", "adresseerbaarobject_id", "Adresseerbaar object ID", "Adresseerbaar object id", "verblijfsobject_id", "Verblijfsobject ID", "object_id", default=""),
         default="",
     )
+    adresseerbaar_object_id = clean_bag_id(adresseerbaar_object_id)
 
     api_data = {}
     if truthy_env("BAG_USE_API", "true") and adresseerbaar_object_id:
@@ -1181,6 +1526,7 @@ def generate_bag_afschrift():
             "dossier_record_id": dossier_record_id,
             "target_field_id": target_field_id,
             "softr_update": "background_started",
+            "bag_data": bag,
             "meta": meta,
         })
 
@@ -1197,9 +1543,9 @@ def generate_bag_afschrift():
         "target_field_id": target_field_id,
         "softr_update_mode": update_result.get("mode") if update_result else None,
         "softr_update_assumed_success": update_result.get("assumed_success", False) if update_result else False,
+        "bag_data": bag,
         "meta": meta,
     })
-
 
 # -----------------------------------------------------------------------------
 # File hosting / upload
