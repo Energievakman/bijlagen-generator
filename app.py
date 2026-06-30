@@ -40,7 +40,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-APP_VERSION = "v13_bag_afschrift_layout_polished_20260630"
+APP_VERSION = "v14_bag_afschrift_table_fit_20260630"
 
 
 @app.errorhandler(HTTPException)
@@ -1264,33 +1264,58 @@ def draw_label_value_rows(c, rows, x, y, label_w=42*mm, row_h=14, font_size=7.4,
 
 
 def draw_box_table(c, title, rows, x, y, w, row_h=14, label_w=None):
+    """Teken een compacte BAG-tabel zonder dat de onderrand door tekst loopt.
+
+    In de vorige versie was de totale tabelhoogte te krap berekend:
+    bij kleine row_h-waardes kwam de baseline van de laatste regel onder de
+    border uit. Deze versie rekent met vaste header-/bodempadding en gebruikt
+    de laatste baseline om de onderkant te bepalen.
+    """
     if label_w is None:
         label_w = w * 0.45
+
     blue = colors.HexColor("#00508F")
     border = colors.HexColor("#1F5E95")
     fill = colors.HexColor("#F3F8FC")
+    grid = colors.HexColor("#D6E2ED")
+
+    title_y = y - 14
+    divider_y = y - 20
+    first_row_y = y - 33
+    bottom_padding = 9
+    last_row_y = first_row_y - row_h * (len(rows) - 1) if rows else first_row_y
+    bottom_y = last_row_y - bottom_padding
+    total_h = y - bottom_y
+
     c.setStrokeColor(border)
     c.setLineWidth(0.7)
-    total_h = 22 + row_h * len(rows)
-    c.roundRect(x, y - total_h, w, total_h, 3, stroke=1, fill=0)
+    c.roundRect(x, bottom_y, w, total_h, 3, stroke=1, fill=0)
+
     c.setFillColor(blue)
     c.setFont("Helvetica-Bold", 8.2)
-    c.drawString(x + 7, y - 14, title)
-    c.setStrokeColor(colors.HexColor("#D6E2ED"))
-    c.line(x + 7, y - 20, x + w - 7, y - 20)
-    cur_y = y - 33
+    c.drawString(x + 7, title_y, title)
+    c.setStrokeColor(grid)
+    c.line(x + 7, divider_y, x + w - 7, divider_y)
+
+    cur_y = first_row_y
     for i, (label, value) in enumerate(rows):
+        row_top = cur_y + 5
+        row_bottom = max(cur_y - row_h + 5, bottom_y + 1)
         if i % 2 == 1:
             c.setFillColor(fill)
-            c.rect(x + 1, cur_y - 4, w - 2, row_h, stroke=0, fill=1)
+            c.rect(x + 1, row_bottom, w - 2, row_top - row_bottom, stroke=0, fill=1)
+
         c.setFillColor(colors.HexColor("#4B5563"))
-        c.setFont("Helvetica", 6.9)
+        c.setFont("Helvetica", 6.75)
         c.drawString(x + 7, cur_y, clean_value(label))
         c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold" if i == 0 else "Helvetica", 6.9)
-        draw_wrapped(c, value, x + label_w, cur_y, w - label_w - 8, size=6.9, leading=8.0, bold=(i == 0))
+        draw_wrapped(
+            c, value, x + label_w, cur_y, w - label_w - 8,
+            size=6.75, leading=7.6, bold=(i == 0)
+        )
         cur_y -= row_h
-    return y - total_h
+
+    return bottom_y
 
 
 def draw_placeholder_map(c, bag, x, y, w, h):
