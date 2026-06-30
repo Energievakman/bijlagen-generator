@@ -40,7 +40,7 @@ except Exception:
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-APP_VERSION = "v12_bag_afschrift_layout_full_20260630"
+APP_VERSION = "v13_bag_afschrift_layout_polished_20260630"
 
 
 @app.errorhandler(HTTPException)
@@ -1183,7 +1183,7 @@ def flatten_bag_data(payload: dict, source_fields: dict, api_data: dict) -> dict
         "documentdatum": now_nl(),
         "tijdstip": datetime.now().strftime("%H:%M:%S"),
         "bron": "BAG API Individuele Bevragingen",
-        "aanvrager": env("BAG_AANVRAGER", "Mijn Portaal B.V."),
+        "aanvrager": env("BAG_AANVRAGER", "De Energievakman"),
         "adres": adres,
         "straat": openbare_ruimte,
         "openbare_ruimte": openbare_ruimte,
@@ -1274,7 +1274,7 @@ def draw_box_table(c, title, rows, x, y, w, row_h=14, label_w=None):
     total_h = 22 + row_h * len(rows)
     c.roundRect(x, y - total_h, w, total_h, 3, stroke=1, fill=0)
     c.setFillColor(blue)
-    c.setFont("Helvetica-Bold", 8.5)
+    c.setFont("Helvetica-Bold", 8.2)
     c.drawString(x + 7, y - 14, title)
     c.setStrokeColor(colors.HexColor("#D6E2ED"))
     c.line(x + 7, y - 20, x + w - 7, y - 20)
@@ -1284,11 +1284,11 @@ def draw_box_table(c, title, rows, x, y, w, row_h=14, label_w=None):
             c.setFillColor(fill)
             c.rect(x + 1, cur_y - 4, w - 2, row_h, stroke=0, fill=1)
         c.setFillColor(colors.HexColor("#4B5563"))
-        c.setFont("Helvetica", 7.2)
+        c.setFont("Helvetica", 6.9)
         c.drawString(x + 7, cur_y, clean_value(label))
         c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold" if i == 0 else "Helvetica", 7.2)
-        draw_wrapped(c, value, x + label_w, cur_y, w - label_w - 8, size=7.2, leading=8.5, bold=(i == 0))
+        c.setFont("Helvetica-Bold" if i == 0 else "Helvetica", 6.9)
+        draw_wrapped(c, value, x + label_w, cur_y, w - label_w - 8, size=6.9, leading=8.0, bold=(i == 0))
         cur_y -= row_h
     return y - total_h
 
@@ -1338,43 +1338,48 @@ def draw_qr(c, value, x, y, size=31*mm):
 
 
 def make_bag_pdf(bag: dict, out_path: Path) -> dict:
-    """Maak een BAG-afschrift in de layout van het voorbeeld."""
+    """Maak een BAG-afschrift in de compacte layout van het voorbeeld.
+
+    V3: rustiger witruimte, geen overlap tussen kaart en tabellen, betere
+    positionering en een subtielere kaart/QR-layout.
+    """
     c = canvas.Canvas(str(out_path), pagesize=A4)
     W, H = A4
-    margin = 16 * mm
+    margin = 15 * mm
     blue = colors.HexColor("#00508F")
+    dark_blue = colors.HexColor("#123A63")
 
     # Header
-    c.setFillColor(colors.HexColor("#123A63"))
-    c.setFont("Helvetica-Bold", 23)
-    c.drawString(margin, H - 33 * mm, "BAG AFSCHRIFT")
+    c.setFillColor(dark_blue)
+    c.setFont("Helvetica-Bold", 22.5)
+    c.drawString(margin, H - 28 * mm, "BAG AFSCHRIFT")
     c.setFillColor(colors.HexColor("#374151"))
-    c.setFont("Helvetica", 11)
-    c.drawString(margin, H - 43 * mm, "Basisregistratie Adressen en Gebouwen (BAG)")
+    c.setFont("Helvetica", 10.5)
+    c.drawString(margin, H - 38 * mm, "Basisregistratie Adressen en Gebouwen (BAG)")
 
-    # Tekstlogo rechtsboven. Geen officieel beeldmerkbestand nodig.
+    # Tekstlogo rechtsboven, subtieler en kleiner dan V2.
     c.setFillColor(colors.HexColor("#0085B2"))
-    c.setFont("Helvetica-Oblique", 9)
-    c.drawString(W - 50 * mm, H - 30 * mm, "kadaster")
+    c.setFont("Helvetica-Oblique", 8.5)
+    c.drawString(W - 48 * mm, H - 25 * mm, "kadaster")
     c.setFillColor(colors.HexColor("#0077A8"))
     p = c.beginPath()
-    p.moveTo(W - 35 * mm, H - 27 * mm)
-    p.lineTo(W - 23 * mm, H - 27 * mm)
-    p.lineTo(W - 44 * mm, H - 58 * mm)
+    p.moveTo(W - 35 * mm, H - 22 * mm)
+    p.lineTo(W - 25 * mm, H - 22 * mm)
+    p.lineTo(W - 43 * mm, H - 51 * mm)
     p.close()
     c.drawPath(p, stroke=0, fill=1)
     c.setFillColor(colors.HexColor("#00508F"))
     p = c.beginPath()
-    p.moveTo(W - 20 * mm, H - 27 * mm)
-    p.lineTo(W - 15 * mm, H - 27 * mm)
-    p.lineTo(W - 31 * mm, H - 58 * mm)
-    p.lineTo(W - 36 * mm, H - 58 * mm)
+    p.moveTo(W - 21 * mm, H - 22 * mm)
+    p.lineTo(W - 16 * mm, H - 22 * mm)
+    p.lineTo(W - 31 * mm, H - 51 * mm)
+    p.lineTo(W - 36 * mm, H - 51 * mm)
     p.close()
     c.drawPath(p, stroke=0, fill=1)
 
     # Linker adresblok
     left_x = margin
-    top_y = H - 62 * mm
+    top_y = H - 57 * mm
     draw_section_title(c, "Adres", left_x, top_y, 86 * mm)
     adres_rows = [
         ("Adres", bag.get("adres")),
@@ -1389,11 +1394,10 @@ def make_bag_pdf(bag: dict, out_path: Path) -> dict:
         ("Datum naamgeving", bag.get("datum_naamgeving")),
         ("Datum beëindiging", "-"),
     ]
-    draw_label_value_rows(c, adres_rows, left_x, top_y - 16, label_w=33 * mm, row_h=13.2, font_size=7.4, value_bold=True)
+    draw_label_value_rows(c, adres_rows, left_x, top_y - 16, label_w=33 * mm, row_h=12.4, font_size=7.15, value_bold=True)
 
-    # Rechter metadata + kaart
-    meta_x = W - margin - 89 * mm
-    meta_y = top_y + 1
+    # Rechter metadata + kaart. Kaart staat nu boven de nummeraanduiding en overlapt niet meer.
+    meta_x = W - margin - 90 * mm
     meta_rows = [
         ("Afschriftnummer", bag.get("afschriftnummer")),
         ("Datum afschrift", bag.get("documentdatum")),
@@ -1401,14 +1405,13 @@ def make_bag_pdf(bag: dict, out_path: Path) -> dict:
         ("Bron", bag.get("bron")),
         ("Aanvrager", bag.get("aanvrager")),
     ]
-    draw_label_value_rows(c, meta_rows, meta_x, meta_y, label_w=36 * mm, row_h=14, font_size=7.3, value_bold=True)
-    draw_placeholder_map(c, bag, meta_x, H - 118 * mm, 89 * mm, 54 * mm)
+    draw_label_value_rows(c, meta_rows, meta_x, top_y, label_w=36 * mm, row_h=13.5, font_size=7.15, value_bold=True)
+    map_top_y = H - 78 * mm
+    draw_placeholder_map(c, bag, meta_x, map_top_y, 90 * mm, 49 * mm)
 
-    # Nummeraanduiding breed
-    y = H - 237 * mm
-    # Actually use absolute placement similar to sample.
-    num_y = H - 123 * mm
-    draw_box_table(c, "Nummeraanduiding", [
+    # Nummeraanduiding breed, netjes onder kaart/adresblok.
+    num_y = H - 136 * mm
+    num_bottom = draw_box_table(c, "Nummeraanduiding", [
         ("Nummeraanduiding ID", bag.get("nummeraanduiding_id")),
         ("Type nummeraanduiding", bag.get("type_nummeraanduiding")),
         ("Status", bag.get("status_nummeraanduiding")),
@@ -1416,12 +1419,12 @@ def make_bag_pdf(bag: dict, out_path: Path) -> dict:
         ("Begindatum geldigheid", bag.get("begin_geldigheid_vbo")),
         ("Einddatum geldigheid", "-"),
         ("In onderzoek", bag.get("in_onderzoek_nummeraanduiding")),
-    ], margin, num_y, W - 2 * margin, row_h=12.7, label_w=55 * mm)
+    ], margin, num_y, W - 2 * margin, row_h=11.1, label_w=55 * mm)
 
-    # Onderste kolommen
-    col_y = H - 174 * mm
+    # Onderste kolommen.
+    col_y = num_bottom - 6 * mm
     col_w = (W - 2 * margin - 6 * mm) / 2
-    draw_box_table(c, "Adresseerbaar object", [
+    left_bottom = draw_box_table(c, "Adresseerbaar object", [
         ("Adresseerbaar object ID", bag.get("verblijfsobject_id")),
         ("Type adresseerbaar object", "Verblijfsobject"),
         ("Status", bag.get("status_verblijfsobject")),
@@ -1433,7 +1436,7 @@ def make_bag_pdf(bag: dict, out_path: Path) -> dict:
         ("Pand ID", bag.get("pand_id")),
         ("Begindatum geldigheid", bag.get("begin_geldigheid_vbo")),
         ("Einddatum geldigheid", bag.get("eind_geldigheid_vbo")),
-    ], margin, col_y, col_w, row_h=11.7, label_w=42 * mm)
+    ], margin, col_y, col_w, row_h=9.7, label_w=40 * mm)
 
     right_x = margin + col_w + 6 * mm
     pand_bottom = draw_box_table(c, "Pand", [
@@ -1445,22 +1448,22 @@ def make_bag_pdf(bag: dict, out_path: Path) -> dict:
         ("Aantal bouwlagen", bag.get("aantal_bouwlagen")),
         ("Begindatum geldigheid", bag.get("begin_geldigheid_pand")),
         ("Einddatum geldigheid", bag.get("eind_geldigheid_pand")),
-    ], right_x, col_y, col_w, row_h=12.3, label_w=42 * mm)
+    ], right_x, col_y, col_w, row_h=10.7, label_w=40 * mm)
 
-    draw_box_table(c, "Standplaats", [("Er is geen standplaats geregistreerd voor dit adres.", "")], right_x, pand_bottom - 6 * mm, col_w, row_h=15, label_w=col_w - 14)
+    draw_box_table(c, "Standplaats", [("Er is geen standplaats geregistreerd voor dit adres.", "")], right_x, pand_bottom - 5 * mm, col_w, row_h=13.0, label_w=col_w - 16)
 
-    # Overig + QR
-    overig_y = 47 * mm
-    overig_w = W - 2 * margin - 63 * mm
+    # Overig + QR, laag maar niet door de voettekst heen.
+    overig_y = 44 * mm
+    overig_w = W - 2 * margin - 64 * mm
     draw_box_table(c, "Overig", [
         ("Gerelateerde objecten", "Zie BAG Viewer of API response voor alle relaties"),
         ("Opmerkingen", "Dit afschrift is automatisch gegenereerd op basis van BAG API Individuele Bevragingen."),
-    ], margin, overig_y, overig_w, row_h=18, label_w=38 * mm)
+    ], margin, overig_y, overig_w, row_h=15.5, label_w=36 * mm)
     qr_value = f"BAG afschrift | {bag.get('adres')} | VBO {bag.get('verblijfsobject_id')}"
-    draw_qr(c, qr_value, W - margin - 31 * mm, overig_y, size=31 * mm)
+    draw_qr(c, qr_value, W - margin - 30 * mm, overig_y - 1 * mm, size=30 * mm)
 
     c.setFillColor(colors.HexColor("#4B5563"))
-    c.setFont("Helvetica", 7)
+    c.setFont("Helvetica", 6.8)
     c.drawString(margin, 10 * mm, "Dit afschrift is geen officieel bewijsstuk. Raadpleeg het Kadaster voor juridische informatie.")
     c.save()
     return {"address": bag.get("adres"), "verblijfsobject_id": bag.get("verblijfsobject_id"), "version": APP_VERSION}
